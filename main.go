@@ -1,12 +1,9 @@
 package main
 
 import (
-	// "bytes"
 	"fmt"
 	"go/ast"
-	// "go/printer"
-	// "go/token"
-	// "go/types"
+	"go/types"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/singlechecker"
@@ -31,7 +28,8 @@ func run(pass *analysis.Pass) (interface{}, error) {
 				return true
 			}
 
-			checkStyle(*ass, pass)
+			emittedShouldFix := checkNilnessAssertions(*ass, pass)
+			checkStyle(*ass, pass, !emittedShouldFix)
 
 			// FIXME what should we return here? Can assertions be nested?
 			return true
@@ -51,6 +49,35 @@ type assertion struct {
 	Negated       bool       // whether the matcher is negated (eg. when using `ShouldNot`)
 }
 
+func checkStyle(ass assertion, pass *analysis.Pass, emitFixes bool) {
+	if getStyle(ass.Omega.Name) == getStyle(ass.Should.Name) {
+		return
+	}
+
+	d := analysis.Diagnostic{
+		Pos: ass.Pos(),
+		End: ass.End(),
+		Message: fmt.Sprintf(
+			"inconsistent assertion style (%s + %s)",
+			ass.Omega.Name, ass.Should.Name,
+		),
+	}
+
+	if emitFixes {
+		fixedShould := renderInStyle(getStyle(ass.Omega.Name), ass.Negated)
+		d.SuggestedFixes = []analysis.SuggestedFix{{
+			Message: fmt.Sprintf("change %s to %s", ass.Should.Name, fixedShould),
+			TextEdits: []analysis.TextEdit{{
+				Pos:     ass.Should.Pos(),
+				End:     ass.Should.End(),
+				NewText: []byte(fixedShould),
+			}},
+		}}
+	}
+
+	pass.Report(d)
+}
+
 const Omega = "Ω"
 const Expect = "Expect"
 const Should = "Should"
@@ -66,27 +93,73 @@ const (
 	ExpectStyle
 )
 
-func checkStyle(ass assertion, pass *analysis.Pass) {
-	if getStyle(ass.Omega.Name) != getStyle(ass.Should.Name) {
-		d := analysis.Diagnostic{
-			Pos: ass.Pos(),
-			End: ass.End(),
-			Message: fmt.Sprintf(
-				"incosistent assertion style (%s + %s)",
-				ass.Omega.Name, ass.Should.Name,
-			),
-			SuggestedFixes: []analysis.SuggestedFix{{
-				Message: "",
-				TextEdits: []analysis.TextEdit{{
-					Pos:     ass.Should.Pos(),
-					End:     ass.Should.End(),
-					NewText: []byte(renderInStyle(getStyle(ass.Omega.Name), ass.Negated)),
-				}},
-			}},
-		}
-		pass.Report(d)
+// checkNilnessAssertions checks which of IsNil/HaveOccurred/Succeed matchers
+// is the most appropriate and returns, whether a TextEdit for 'Should' part of
+// an assertion was emitted (because of possible need of inverting the
+// condition)
+func checkNilnessAssertions(ass assertion, pass *analysis.Pass) (emittedShouldFix bool) {
+	matcherIdent, matcher := getKnownMatcher(ass)
+	if matcher == UnknownMatcher {
+		return false
 	}
+
+	var expectedMatcher KnownMatcher
+	if isErrorExpr(ass.Subject, pass.TypesInfo) {
+		if _, isCall := ass.Subject.(*ast.CallExpr); isCall {
+			expectedMatcher = Succeed
+		} else {
+			expectedMatcher = HaveOccurred
+		}
+	} else {
+		expectedMatcher = IsNil
+	}
+
+	if matcher == expectedMatcher {
+		return false
+	}
+
+	d := analysis.Diagnostic{
+		Pos: ass.Pos(),
+		End: ass.End(),
+		Message: fmt.Sprintf(
+			"unidiomatic matcher: consider using %s instead of %s in this assertion",
+			expectedMatcher, matcher,
+		),
+		SuggestedFixes: []analysis.SuggestedFix{{
+			Message: fmt.Sprintf("change matcher to %s", expectedMatcher),
+			TextEdits: []analysis.TextEdit{{
+				Pos:     matcherIdent.Pos(),
+				End:     matcherIdent.End(),
+				NewText: []byte(expectedMatcher),
+			}},
+		}},
+	}
+
+	needsInverting := matchesNil(matcher) != matchesNil(expectedMatcher)
+	if needsInverting {
+		d.SuggestedFixes[0].TextEdits = append(d.SuggestedFixes[0].TextEdits, analysis.TextEdit{
+			Pos:     ass.Should.Pos(),
+			End:     ass.Should.End(),
+			NewText: []byte(renderInStyle(getStyle(ass.Omega.Name), ass.Negated != needsInverting)),
+		})
+		d.SuggestedFixes[0].Message += " and invert the assertion"
+	}
+
+	pass.Report(d)
+
+	return needsInverting
 }
+
+type KnownMatcher string
+
+const (
+	UnknownMatcher KnownMatcher = ""
+	IsNil          KnownMatcher = "BeNil"
+	HaveOccurred   KnownMatcher = "HaveOccurred"
+	Succeed        KnownMatcher = "Succeed"
+)
+
+func matchesNil(m KnownMatcher) bool { return m != HaveOccurred }
 
 func getAssertion(n ast.Node) *assertion {
 	call, ok := n.(*ast.CallExpr)
@@ -166,3 +239,31 @@ func renderInStyle(style Style, negated bool) string {
 		panic("bar")
 	}
 }
+
+func getKnownMatcher(ass assertion) (*ast.Ident, KnownMatcher) {
+	call, ok := ass.Matcher.(*ast.CallExpr)
+	if !ok || len(call.Args) != 0 {
+		return nil, UnknownMatcher
+	}
+
+	matcherIdent, ok := call.Fun.(*ast.Ident)
+	if !ok {
+		return nil, UnknownMatcher
+	}
+
+	knownMatcher := KnownMatcher(matcherIdent.Name)
+	switch knownMatcher {
+	case IsNil, HaveOccurred, Succeed:
+		return matcherIdent, knownMatcher
+	default:
+		return nil, UnknownMatcher
+	}
+}
+
+// isErrorExpr returns whether expr's type is an error or something that implements it
+func isErrorExpr(e ast.Expr, info *types.Info) bool {
+	t := info.Types[e].Type
+	return types.Implements(t, errorInterface)
+}
+
+var errorInterface = types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
