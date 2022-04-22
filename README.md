@@ -33,7 +33,7 @@ This applies the following suggestion:
 ## Installation
 
 ```
-go get github.com/krdln/gomegalint
+go install github.com/krdln/gomegalint@latest
 ```
 
 [gomega]: https://onsi.github.io/gomega/
